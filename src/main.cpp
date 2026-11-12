@@ -56,8 +56,8 @@ constexpr uint8_t RELAY_OFF = LOW;
 constexpr uint16_t RC_CAPTURE_MIN = 800;
 constexpr uint16_t RC_CAPTURE_MAX = 2500;
 
-constexpr uint16_t RC_MIN = 900;
-constexpr uint16_t RC_MAX = 2400;
+constexpr uint16_t ACTUATOR_RC_MIN = 1000;
+constexpr uint16_t ACTUATOR_RC_MAX = 2000;
 
 constexpr uint16_t RC_CENTER = 1500;
 constexpr uint16_t RC_DEADBAND = 50;
@@ -239,15 +239,19 @@ bool inNeutral(uint16_t us) {
 }
 
 float rcCommand(uint16_t us) {
-    int delta = (int)us - RC_CENTER;
+    // CH2: saturate accepted RC pulses at the calibrated endpoints.
+    const uint16_t bounded = constrain(
+        us, ACTUATOR_RC_MIN, ACTUATOR_RC_MAX
+    );
+    int delta = (int)bounded - RC_CENTER;
 
     if (abs(delta) <= RC_DEADBAND) {
         return 0.0f;
     }
 
     float range = delta < 0
-        ? float(RC_CENTER - RC_MIN - RC_DEADBAND)
-        : float(RC_MAX - RC_CENTER - RC_DEADBAND);
+        ? float(RC_CENTER - ACTUATOR_RC_MIN - RC_DEADBAND)
+        : float(ACTUATOR_RC_MAX - RC_CENTER - RC_DEADBAND);
 
     float value =
         float(abs(delta) - RC_DEADBAND) / range;
