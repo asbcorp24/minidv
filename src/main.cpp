@@ -673,9 +673,8 @@ void updateActuator(
         ACTUATOR_RAMP * dt
     );
 
-    if (fabsf(actuatorDuty) < 0.5f) {
-        actuatorDuty = 0;
-    }
+    // Preserve fractional duty so fast loop iterations can accumulate.
+    // rampTo() reaches zero exactly when stopping or reversing.
 
     int direction =
         actuatorDuty > 0 ? 1 :
@@ -814,9 +813,8 @@ void updateAnalog(
         DAC_RAMP * dt
     );
 
-    if (dacLevel < 0.5f) {
-        dacLevel = 0;
-    }
+    // Preserve fractional DAC levels until the hardware output is rounded.
+    // rampTo() reaches zero exactly before the relay changes direction.
 
     // Switch relay only when DAC is zero
     if (dacLevel == 0 &&
