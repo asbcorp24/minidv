@@ -5,16 +5,14 @@
 // =====================================================
 // ESP32-WROOM-32 DEVKIT
 //
-// CH1: NEMA17 + HW-095 (L298N)
+// CH1: NEMA17 + A4988 (full-step mode)
 // CH2: 12V ACTUATOR + HW-039 (BTS7960)
 // CH3: DAC + RELAY
 //
 // PlatformIO / Arduino Core 2.x
 // =====================================================
 
-// IMPORTANT:
-// L298N does not regulate the stepper phase current.
-// Keep disabled until current has been checked.
+// Set the A4988 current limit before connecting the stepper.
 #define ENABLE_STEPPER_POWER 1
 #define ENABLE_ACTUATOR_POWER 1
 
@@ -27,13 +25,10 @@ constexpr uint8_t RC1_PIN = 27;
 constexpr uint8_t RC2_PIN = 34;
 constexpr uint8_t RC3_PIN = 35;
 
-// HW-095
-constexpr uint8_t IN1 = 16;
-constexpr uint8_t IN2 = 17;
-constexpr uint8_t IN3 = 18;
-constexpr uint8_t IN4 = 19;
-constexpr uint8_t ENA = 21;
-constexpr uint8_t ENB = 26;
+// A4988
+constexpr uint8_t STEPPER_STEP_PIN = 16;
+constexpr uint8_t STEPPER_DIR_PIN = 17;
+constexpr uint8_t STEPPER_ENABLE_PIN = 21;
 
 // HW-039
 constexpr uint8_t RPWM = 32;
@@ -70,6 +65,7 @@ constexpr uint32_t RC_TIMEOUT_US = 200000UL;
 // =====================================================
 
 constexpr int32_t STEPS_PER_TURN = 200;
+constexpr uint32_t STEPPER_PULSE_US = 2;
 
 constexpr float STEPPER_MAX_SPEED = 60.0f;
 constexpr float STEPPER_ACCEL = 30.0f;
@@ -288,43 +284,21 @@ int32_t stepperTarget = 0;
 
 float stepperSpeed = 0;
 
-uint8_t stepPhase = 0;
-
 uint32_t lastStepUs = 0;
 
 void stepperPower(bool enable) {
     stepperPowered =
         ENABLE_STEPPER_POWER && enable;
 
-    digitalWrite(
-        ENA,
-        stepperPowered ? HIGH : LOW
-    );
-
-    digitalWrite(
-        ENB,
-        stepperPowered ? HIGH : LOW
-    );
+    digitalWrite(STEPPER_ENABLE_PIN, stepperPowered ? LOW : HIGH);
 }
 
-void setStepPhase(uint8_t phase) {
-    static const uint8_t table[4][4] = {
-        {1, 0, 1, 0},
-        {0, 1, 1, 0},
-        {0, 1, 0, 1},
-        {1, 0, 0, 1}
-    };
-
-    const uint8_t pins[4] = {
-        IN1, IN2, IN3, IN4
-    };
-
-    for (int i = 0; i < 4; i++) {
-        digitalWrite(
-            pins[i],
-            table[phase & 3][i]
-        );
-    }
+void pulseStepper(int direction) {
+    digitalWrite(STEPPER_DIR_PIN, direction > 0 ? HIGH : LOW);
+    delayMicroseconds(STEPPER_PULSE_US);
+    digitalWrite(STEPPER_STEP_PIN, HIGH);
+    delayMicroseconds(STEPPER_PULSE_US);
+    digitalWrite(STEPPER_STEP_PIN, LOW);
 }
 
 int32_t targetSteps(uint16_t us) {
@@ -368,9 +342,6 @@ void updateStepper(
         stepperPosition = 0;
         stepperTarget = 0;
         stepperSpeed = 0;
-        stepPhase = 0;
-
-        setStepPhase(stepPhase);
         lastStepUs = now;
 
         Serial.println(
@@ -456,12 +427,7 @@ void updateStepper(
 
         lastStepUs = now;
 
-        stepPhase = (
-            stepPhase +
-            (actualDirection > 0 ? 1 : 3)
-        ) & 3;
-
-        setStepPhase(stepPhase);
+        pulseStepper(actualDirection);
 
         stepperPosition += actualDirection;
     }
@@ -966,17 +932,16 @@ void setup() {
     dacWrite(DAC_PIN, 0);
 
     // Stepper
-    const uint8_t stepPins[] = {
-        IN1, IN2, IN3, IN4, ENA, ENB
-    };
-
-    for (uint8_t pin : stepPins) {
-        pinMode(pin, OUTPUT);
-        digitalWrite(pin, LOW);
-    }
-
+    // Set the output latch while the external pull-up holds EN high.
+    pinMode(STEPPER_ENABLE_PIN, INPUT);
+    digitalWrite(STEPPER_ENABLE_PIN, HIGH);
+    pinMode(STEPPER_ENABLE_PIN, OUTPUT);
     stepperPower(false);
-    setStepPhase(0);
+
+    pinMode(STEPPER_STEP_PIN, OUTPUT);
+    digitalWrite(STEPPER_STEP_PIN, LOW);
+    pinMode(STEPPER_DIR_PIN, OUTPUT);
+    digitalWrite(STEPPER_DIR_PIN, LOW);
 
     // HW-039
     pinMode(R_EN, OUTPUT);
