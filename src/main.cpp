@@ -5,14 +5,14 @@
 // =====================================================
 // ESP32-WROOM-32 DEVKIT
 //
-// CH1: NEMA17 + A4988 (full-step mode)
+// CH1: NEMA17 + DM556 (continuous rotation)
 // CH2: 12V ACTUATOR + HW-039 (BTS7960)
 // CH3: DAC + RELAY
 //
 // PlatformIO / Arduino Core 2.x
 // =====================================================
 
-// Set the A4988 current limit before connecting the stepper.
+// Set the DM556 phase current and connect a non-inverting 3.3 V to 5 V interface.
 #define ENABLE_STEPPER_POWER 1
 #define ENABLE_ACTUATOR_POWER 1
 
@@ -25,7 +25,7 @@ constexpr uint8_t RC1_PIN = 27;
 constexpr uint8_t RC2_PIN = 34;
 constexpr uint8_t RC3_PIN = 35;
 
-// A4988
+// DM556 through a non-inverting 5 V control interface
 constexpr uint8_t STEPPER_STEP_PIN = 16;
 constexpr uint8_t STEPPER_DIR_PIN = 17;
 constexpr uint8_t STEPPER_ENABLE_PIN = 21;
@@ -64,13 +64,18 @@ constexpr uint32_t RC_TIMEOUT_US = 200000UL;
 // STEPPER SETTINGS
 // =====================================================
 
-constexpr int32_t STEPS_PER_TURN = 200;
-constexpr uint32_t STEPPER_PULSE_US = 2;
+constexpr uint16_t STEPPER_RC_MIN = 1000;
+constexpr uint16_t STEPPER_RC_MAX = 2000;
+constexpr uint16_t STEPPER_RC_REVERSE = 1400;
+constexpr uint16_t STEPPER_RC_FORWARD = 1600;
+
+constexpr uint32_t STEPPER_PULSE_US = 5;
+constexpr uint32_t STEPPER_DIR_SETUP_US = 10;
+constexpr uint32_t STEPPER_ENABLE_DELAY_US = 300000UL;
 
 constexpr float STEPPER_MAX_SPEED = 60.0f;
 constexpr float STEPPER_ACCEL = 30.0f;
 
-constexpr bool STEPPER_RELEASE_IDLE = true;
 
 // =====================================================
 // ACTUATOR SETTINGS
@@ -273,49 +278,46 @@ float rampTo(
 }
 
 // =====================================================
-// CH1 - STEPPER POSITION CONTROL
+// CH1 - STEPPER CONTINUOUS ROTATION
 // =====================================================
 
-bool stepperReference = false;
 bool stepperPowered = false;
-
-int32_t stepperPosition = 0;
-int32_t stepperTarget = 0;
-
+int stepperCommandDirection = 0;
 float stepperSpeed = 0;
 
 uint32_t lastStepUs = 0;
+uint32_t stepperEnabledAtUs = 0;
 
 void stepperPower(bool enable) {
     stepperPowered =
         ENABLE_STEPPER_POWER && enable;
 
+    // Non-inverting 5 V interface: ENA HIGH disables the DM556.
     digitalWrite(STEPPER_ENABLE_PIN, stepperPowered ? LOW : HIGH);
 }
 
 void pulseStepper(int direction) {
     digitalWrite(STEPPER_DIR_PIN, direction > 0 ? HIGH : LOW);
-    delayMicroseconds(STEPPER_PULSE_US);
+    delayMicroseconds(STEPPER_DIR_SETUP_US);
     digitalWrite(STEPPER_STEP_PIN, HIGH);
     delayMicroseconds(STEPPER_PULSE_US);
     digitalWrite(STEPPER_STEP_PIN, LOW);
 }
 
-int32_t targetSteps(uint16_t us) {
-    // 1000us = 0 degrees
-    // 1500us = 180 degrees
-    // 2000us = 360 degrees
+int stepperDirection(uint16_t us) {
+    if (us < STEPPER_RC_MIN || us > STEPPER_RC_MAX) {
+        return 0;
+    }
 
-    int bounded = constrain(
-        (int)us,
-        1000,
-        2000
-    );
+    if (us > STEPPER_RC_FORWARD) {
+        return 1;
+    }
 
-    return (
-        (bounded - 1000) *
-        STEPS_PER_TURN + 500
-    ) / 1000;
+    if (us < STEPPER_RC_REVERSE) {
+        return -1;
+    }
+
+    return 0;
 }
 
 void updateStepper(
@@ -323,71 +325,36 @@ void updateStepper(
     uint32_t now,
     float dt
 ) {
-    if (!rc.valid) {
-        stepperReference = false;
+    stepperCommandDirection = rc.valid && ENABLE_STEPPER_POWER
+        ? stepperDirection(rc.us)
+        : 0;
 
-        stepperPosition = 0;
-        stepperTarget = 0;
-        stepperSpeed = 0;
-
-        stepperPower(false);
-        lastStepUs = now;
-        return;
-    }
-
-    if (!stepperReference) {
-        stepperReference = true;
-
-        // Relative zero at current shaft position
-        stepperPosition = 0;
-        stepperTarget = 0;
-        stepperSpeed = 0;
-        lastStepUs = now;
-
-        Serial.println(
-            "CH1: RELATIVE ZERO INITIALIZED"
-        );
-    }
-
-    stepperTarget = targetSteps(rc.us);
-
-    if (!ENABLE_STEPPER_POWER) {
+    // Stop pulses immediately in neutral, out of range, or on signal loss.
+    if (stepperCommandDirection == 0) {
         stepperSpeed = 0;
         stepperPower(false);
-        return;
-    }
-
-    int32_t remaining =
-        stepperTarget - stepperPosition;
-
-    if (remaining == 0 &&
-        fabsf(stepperSpeed) < 0.5f) {
-
-        stepperSpeed = 0;
-
-        stepperPower(
-            !STEPPER_RELEASE_IDLE
-        );
-
+        digitalWrite(STEPPER_STEP_PIN, LOW);
         lastStepUs = now;
         return;
     }
 
-    int direction =
-        remaining > 0 ? 1 :
-        remaining < 0 ? -1 : 0;
+    if (!stepperPowered) {
+        stepperPower(true);
+        stepperEnabledAtUs = now;
+        lastStepUs = now;
+    }
 
-    float brakingSpeed = sqrtf(
-        2.0f *
-        STEPPER_ACCEL *
-        fabsf((float)remaining)
-    );
+    // Wait without blocking CH2/CH3 while the DM556 enables its outputs.
+    if ((uint32_t)(now - stepperEnabledAtUs) < STEPPER_ENABLE_DELAY_US) {
+        return;
+    }
 
-    float wanted =
-        direction * fminf(
-            STEPPER_MAX_SPEED,
-            brakingSpeed
-        );
+    float wanted = stepperCommandDirection * STEPPER_MAX_SPEED;
+
+    // Decelerate to zero before issuing pulses in the opposite direction.
+    if (stepperSpeed * wanted < 0) {
+        wanted = 0;
+    }
 
     stepperSpeed = rampTo(
         stepperSpeed,
@@ -395,41 +362,17 @@ void updateStepper(
         STEPPER_ACCEL * dt
     );
 
-    if (remaining == 0 ||
-        fabsf(stepperSpeed) < 0.5f) {
-
-        if (remaining == 0) {
-            stepperPower(false);
-        }
-
+    if (fabsf(stepperSpeed) < 0.5f) {
         lastStepUs = now;
         return;
     }
 
-    int actualDirection =
-        stepperSpeed > 0 ? 1 : -1;
+    const uint32_t interval =
+        (uint32_t)(1000000.0f / fabsf(stepperSpeed));
 
-    if (actualDirection != direction) {
+    if ((uint32_t)(now - lastStepUs) >= interval) {
         lastStepUs = now;
-        return;
-    }
-
-    stepperPower(true);
-
-    uint32_t interval =
-        (uint32_t)(
-            1000000.0f /
-            fabsf(stepperSpeed)
-        );
-
-    if ((uint32_t)(now - lastStepUs)
-        >= interval) {
-
-        lastStepUs = now;
-
-        pulseStepper(actualDirection);
-
-        stepperPosition += actualDirection;
+        pulseStepper(stepperSpeed > 0 ? 1 : -1);
     }
 }
 
@@ -883,13 +826,9 @@ void printDiagnostics(
     printRc("CH3 GPIO35", d);
 
     Serial.printf(
-        "STEPPER: ref=%d pos=%ld target=%ld "
-        "angle=%.1f/%.1f power=%d\n",
-        (int)stepperReference,
-        (long)stepperPosition,
-        (long)stepperTarget,
-        stepperPosition * 1.8f,
-        stepperTarget * 1.8f,
+        "STEPPER DM556: command=%d speed=%.1f pulses/s power=%d\n",
+        stepperCommandDirection,
+        stepperSpeed,
         (int)stepperPowered
     );
 
@@ -995,7 +934,7 @@ void setup() {
     );
 
     Serial.println(
-        "CH1: STEPPER POSITION 0..360"
+        "CH1: DM556 1000..1399 REVERSE, 1400..1600 STOP, 1601..2000 FORWARD"
     );
 
     Serial.println(
